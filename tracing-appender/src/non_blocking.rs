@@ -106,6 +106,7 @@ pub struct WorkerGuard {
     _guard: Option<JoinHandle<()>>,
     sender: Sender<Msg>,
     shutdown: Sender<()>,
+    shutdown_timeout: Duration,
 }
 
 /// A non-blocking writer.
@@ -144,7 +145,7 @@ impl NonBlocking {
     /// The returned `NonBlocking` writer will have the [default configuration][default] values.
     /// Other configurations can be specified using the [builder] interface.
     ///
-    /// [default]: NonBlockingBuilder::default
+    /// [default]: NonBlockingBuilder::default()
     /// [builder]: NonBlockingBuilder
     pub fn new<T: Write + Send + 'static>(writer: T) -> (NonBlocking, WorkerGuard) {
         NonBlockingBuilder::default().finish(writer)
@@ -155,6 +156,7 @@ impl NonBlocking {
         buffered_lines_limit: usize,
         is_lossy: bool,
         thread_name: String,
+        shutdown_timeout: Duration,
     ) -> (NonBlocking, WorkerGuard) {
         let (sender, receiver) = bounded(buffered_lines_limit);
 
@@ -165,6 +167,7 @@ impl NonBlocking {
             worker.worker_thread(thread_name),
             sender.clone(),
             shutdown_sender,
+            shutdown_timeout,
         );
 
         (
@@ -192,6 +195,7 @@ pub struct NonBlockingBuilder {
     buffered_lines_limit: usize,
     is_lossy: bool,
     thread_name: String,
+    shutdown_timeout: Duration,
 }
 
 impl NonBlockingBuilder {
@@ -227,7 +231,19 @@ impl NonBlockingBuilder {
             self.buffered_lines_limit,
             self.is_lossy,
             self.thread_name,
+            self.shutdown_timeout,
         )
+    }
+
+    /// Sets the timeout for shutdown of the worker thread.
+    /// 
+    /// This is the maximum amount of time the main thread will wait
+    /// for the worker thread to finish proccessing pending logs during shutdown
+    /// 
+    /// The default timeout is 1 second.
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> NonBlockingBuilder {
+        self.shutdown_timeout = timeout;
+        self
     }
 }
 
@@ -237,6 +253,7 @@ impl Default for NonBlockingBuilder {
             buffered_lines_limit: DEFAULT_BUFFERED_LINES_LIMIT,
             is_lossy: true,
             thread_name: "tracing-appender".to_string(),
+            shutdown_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -276,36 +293,47 @@ impl<'a> MakeWriter<'a> for NonBlocking {
 }
 
 impl WorkerGuard {
-    fn new(handle: JoinHandle<()>, sender: Sender<Msg>, shutdown: Sender<()>) -> Self {
+    fn new(handle: JoinHandle<()>, sender: Sender<Msg>, shutdown: Sender<()>, shutdown_timeout: Duration,) -> Self {
         WorkerGuard {
             _guard: Some(handle),
             sender,
             shutdown,
+            shutdown_timeout,
         }
     }
 }
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        match self
-            .sender
-            .send_timeout(Msg::Shutdown, Duration::from_millis(100))
-        {
-            Ok(_) => {
-                // Attempt to wait for `Worker` to flush all messages before dropping. This happens
-                // when the `Worker` calls `recv()` on a zero-capacity channel. Use `send_timeout`
-                // so that drop is not blocked indefinitely.
-                // TODO: Make timeout configurable.
-                let _ = self.shutdown.send_timeout((), Duration::from_millis(1000));
+        match self.sender.send_timeout(Msg::Shutdown, Duration::from_millis(100)) {
+                Ok(_) => {
+                    // Attempt to wait for `Worker` to flush all messages before dropping. This happens
+                    // when the `Worker` calls `recv()` on a zero-capacity channel. Use `send_timeout`
+                    // so that drop is not blocked indefinitely.
+                    // The shutdown timeout now is configurable
+                    match self.shutdown.send_timeout((), self.shutdown_timeout) {
+                        Ok(_) => (),
+                        Err(SendTimeoutError::Timeout(_)) => {
+                            eprintln!(
+                                "Shutting down logging worker timed out after {:?}.",
+                                self.shutdown_timeout
+                            );
+                        }
+                        Err(SendTimeoutError::Disconnected(_)) => {
+                            eprintln!("Shutdown failed because logging worker was disconnected");
+                        }
+                    }
+                }
+                Err(SendTimeoutError::Timeout(e)) => eprintln!(
+                    "Failed to send shutdown signal to logging worker. Error: {:?}",
+                    e
+                ),
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    eprintln!("Logging worker disconnected before shutdown signal");
+                }
             }
-            Err(SendTimeoutError::Disconnected(_)) => (),
-            Err(SendTimeoutError::Timeout(e)) => println!(
-                "Failed to send shutdown signal to logging worker. Error: {:?}",
-                e
-            ),
         }
     }
-}
 
 // === impl ErrorCounter ===
 
@@ -492,5 +520,84 @@ mod test {
 
         assert_eq!(10, hello_count);
         assert_eq!(0, error_count.dropped_lines());
+    }
+
+    #[test]
+    fn shutdown_completes_after_timeout() {
+        // Modify the MockWriter with a delay on every write operation
+        struct DelayedMockWriter {
+            tx: mpsc::SyncSender<String>,
+            delay: Duration,
+        }
+
+        impl DelayedMockWriter {
+            fn new(capacity: usize, delay: Duration) -> (Self, mpsc::Receiver<String>) {
+                let (tx, rx) = mpsc::sync_channel(capacity);
+                (Self {tx, delay}, rx)
+            }
+        }
+
+        impl std::io::Write for DelayedMockWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                thread::sleep(self.delay);
+
+                let buf_len = buf.len();
+                let _ = self.tx.send(String::from_utf8_lossy(buf).to_string());
+                Ok(buf_len)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let delay = Duration::from_millis(100);
+        let (mock_writer, rx) = DelayedMockWriter::new(5, delay);
+        
+        // configure the non-blocking writer to wait for at most 200ms during shutdown
+        let timeout = Duration::from_millis(200);
+    
+        let (mut non_blocking, guard) = NonBlockingBuilder::default()
+            .shutdown_timeout(timeout)
+            .finish(mock_writer);
+        
+        // write 10 messages each takes ~1 second so exceeding the timeout
+        for i in 0..10 {
+            non_blocking.write_all(format!("Message {}\n", i).as_bytes()).unwrap();
+        }
+    
+        let start = std::time::Instant::now();
+        drop(guard);
+        let elapsed = start.elapsed();
+    
+        assert!(elapsed >= timeout);
+        assert!(elapsed < timeout + Duration::from_millis(100));
+    
+        while rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+    }
+
+    #[test]
+    fn shutdown_completes_before_timeout() {
+        let (mock_writer, rx) = MockWriter::new(10);
+        let short_timeout = Duration::from_millis(100);
+
+        let (mut non_blocking, guard) = NonBlockingBuilder::default()
+            .shutdown_timeout(short_timeout)
+            .finish(mock_writer);
+
+        for i in 0..3 {
+            non_blocking.write_all(format!("Message {}\n", i).as_bytes()).unwrap();
+        }
+
+        for _ in 0..3 {
+            rx.recv_timeout(Duration::from_millis(50)).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        drop(guard);
+        let elapsed = start.elapsed();
+
+        assert!(elapsed <= short_timeout);
+        assert!(elapsed < Duration::from_millis(50));
     }
 }
