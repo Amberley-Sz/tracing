@@ -15,9 +15,7 @@ struct BlockingMemoryWriter {
 
 impl BlockingMemoryWriter {
     fn new() -> Self {
-        Self {
-            buffer: Vec::new()
-        }
+        Self { buffer: Vec::new() }
     }
 }
 

@@ -236,10 +236,10 @@ impl NonBlockingBuilder {
     }
 
     /// Sets the timeout for shutdown of the worker thread.
-    /// 
+    ///
     /// This is the maximum amount of time the main thread will wait
     /// for the worker thread to finish proccessing pending logs during shutdown
-    /// 
+    ///
     /// The default timeout is 1 second.
     pub fn shutdown_timeout(mut self, timeout: Duration) -> NonBlockingBuilder {
         self.shutdown_timeout = timeout;
@@ -293,7 +293,12 @@ impl<'a> MakeWriter<'a> for NonBlocking {
 }
 
 impl WorkerGuard {
-    fn new(handle: JoinHandle<()>, sender: Sender<Msg>, shutdown: Sender<()>, shutdown_timeout: Duration,) -> Self {
+    fn new(
+        handle: JoinHandle<()>,
+        sender: Sender<Msg>,
+        shutdown: Sender<()>,
+        shutdown_timeout: Duration,
+    ) -> Self {
         WorkerGuard {
             _guard: Some(handle),
             sender,
@@ -305,35 +310,38 @@ impl WorkerGuard {
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        match self.sender.send_timeout(Msg::Shutdown, Duration::from_millis(100)) {
-                Ok(_) => {
-                    // Attempt to wait for `Worker` to flush all messages before dropping. This happens
-                    // when the `Worker` calls `recv()` on a zero-capacity channel. Use `send_timeout`
-                    // so that drop is not blocked indefinitely.
-                    // The shutdown timeout now is configurable
-                    match self.shutdown.send_timeout((), self.shutdown_timeout) {
-                        Ok(_) => (),
-                        Err(SendTimeoutError::Timeout(_)) => {
-                            eprintln!(
-                                "Shutting down logging worker timed out after {:?}.",
-                                self.shutdown_timeout
-                            );
-                        }
-                        Err(SendTimeoutError::Disconnected(_)) => {
-                            eprintln!("Shutdown failed because logging worker was disconnected");
-                        }
+        match self
+            .sender
+            .send_timeout(Msg::Shutdown, Duration::from_millis(100))
+        {
+            Ok(_) => {
+                // Attempt to wait for `Worker` to flush all messages before dropping. This happens
+                // when the `Worker` calls `recv()` on a zero-capacity channel. Use `send_timeout`
+                // so that drop is not blocked indefinitely.
+                // The shutdown timeout now is configurable
+                match self.shutdown.send_timeout((), self.shutdown_timeout) {
+                    Ok(_) => (),
+                    Err(SendTimeoutError::Timeout(_)) => {
+                        eprintln!(
+                            "Shutting down logging worker timed out after {:?}.",
+                            self.shutdown_timeout
+                        );
+                    }
+                    Err(SendTimeoutError::Disconnected(_)) => {
+                        eprintln!("Shutdown failed because logging worker was disconnected");
                     }
                 }
-                Err(SendTimeoutError::Timeout(e)) => eprintln!(
-                    "Failed to send shutdown signal to logging worker. Error: {:?}",
-                    e
-                ),
-                Err(SendTimeoutError::Disconnected(_)) => {
-                    eprintln!("Logging worker disconnected before shutdown signal");
-                }
+            }
+            Err(SendTimeoutError::Timeout(e)) => eprintln!(
+                "Failed to send shutdown signal to logging worker. Error: {:?}",
+                e
+            ),
+            Err(SendTimeoutError::Disconnected(_)) => {
+                eprintln!("Logging worker disconnected before shutdown signal");
             }
         }
     }
+}
 
 // === impl ErrorCounter ===
 
@@ -375,7 +383,7 @@ impl ErrorCounter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -523,27 +531,40 @@ mod test {
     }
 
     #[test]
-    fn shutdown_completes_after_timeout() {
-        // Modify the MockWriter with a delay on every write operation
-        struct DelayedMockWriter {
-            tx: mpsc::SyncSender<String>,
-            delay: Duration,
+    fn test_shutdown_timeout_behavior() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct SlowWriter {
+            counter: Arc<AtomicUsize>,
+            sleep_duration: Duration,
+            messages: Arc<Mutex<Vec<String>>>,
         }
 
-        impl DelayedMockWriter {
-            fn new(capacity: usize, delay: Duration) -> (Self, mpsc::Receiver<String>) {
-                let (tx, rx) = mpsc::sync_channel(capacity);
-                (Self {tx, delay}, rx)
+        impl SlowWriter {
+            fn new(sleep_duration: Duration) -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+                let counter = Arc::new(AtomicUsize::new(0));
+                let messages = Arc::new(Mutex::new(Vec::new()));
+                (
+                    Self {
+                        counter: counter.clone(),
+                        sleep_duration,
+                        messages: messages.clone(),
+                    },
+                    counter,
+                    messages,
+                )
             }
         }
 
-        impl std::io::Write for DelayedMockWriter {
+        impl std::io::Write for SlowWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                thread::sleep(self.delay);
-
-                let buf_len = buf.len();
-                let _ = self.tx.send(String::from_utf8_lossy(buf).to_string());
-                Ok(buf_len)
+                if let Ok(msg) = String::from_utf8(buf.to_vec()) {
+                    self.messages.lock().unwrap().push(msg);
+                }
+                thread::sleep(self.sleep_duration);
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                Ok(buf.len())
             }
 
             fn flush(&mut self) -> std::io::Result<()> {
@@ -551,53 +572,134 @@ mod test {
             }
         }
 
-        let delay = Duration::from_millis(100);
-        let (mock_writer, rx) = DelayedMockWriter::new(5, delay);
-        
-        // configure the non-blocking writer to wait for at most 200ms during shutdown
-        let timeout = Duration::from_millis(200);
-    
-        let (mut non_blocking, guard) = NonBlockingBuilder::default()
-            .shutdown_timeout(timeout)
-            .finish(mock_writer);
-        
-        // write 10 messages each takes ~1 second so exceeding the timeout
-        for i in 0..10 {
-            non_blocking.write_all(format!("Message {}\n", i).as_bytes()).unwrap();
+        // Test 1: All messages should complete when timeout is sufficient
+        {
+            let operation_time = Duration::from_millis(50);
+            let timeout = Duration::from_millis(200);
+            let message_count = 3;
+
+            let (writer, counter, messages) = SlowWriter::new(operation_time);
+            let (mut non_blocking, guard) = NonBlockingBuilder::default()
+                .shutdown_timeout(timeout)
+                .finish(writer);
+
+            for i in 0..message_count {
+                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
+            }
+
+            thread::sleep(operation_time);
+            drop(guard);
+
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                message_count,
+                "With sufficient timeout ({:?}), all {} messages should be processed",
+                timeout,
+                message_count
+            );
+
+            let final_messages = messages.lock().unwrap();
+            for (i, msg) in final_messages.iter().enumerate() {
+                assert_eq!(
+                    msg.trim(),
+                    format!("msg{}", i),
+                    "Messages should be processed in order"
+                );
+            }
         }
-    
-        let start = std::time::Instant::now();
-        drop(guard);
-        let elapsed = start.elapsed();
-    
-        assert!(elapsed >= timeout);
-        assert!(elapsed < timeout + Duration::from_millis(100));
-    
-        while rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+
+        // Test 2: Not all messages should complete when timeout is insufficient
+        {
+            let operation_time = Duration::from_millis(100);
+            let timeout = Duration::from_millis(150);
+            let message_count = 3;
+
+            let (writer, counter, _messages) = SlowWriter::new(operation_time);
+            let (mut non_blocking, guard) = NonBlockingBuilder::default()
+                .shutdown_timeout(timeout)
+                .finish(writer);
+
+            for i in 0..message_count {
+                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
+            }
+
+            thread::sleep(operation_time);
+            drop(guard);
+
+            let processed_count = counter.load(Ordering::SeqCst);
+            assert!(
+                processed_count < message_count,
+                "With insufficient timeout ({:?}), not all messages should complete (processed: {}/{})",
+                timeout,
+                processed_count,
+                message_count
+            );
+            assert!(
+                processed_count > 0,
+                "Even with insufficient timeout, some messages should be processed"
+            );
+        }
+
+        // Test 3: Single message should complete well within timeout
+        {
+            let operation_time = Duration::from_millis(50);
+            let timeout = Duration::from_millis(100);
+
+            let (writer, counter, messages) = SlowWriter::new(operation_time);
+            let (mut non_blocking, guard) = NonBlockingBuilder::default()
+                .shutdown_timeout(timeout)
+                .finish(writer);
+
+            non_blocking.write_all(b"single\n").unwrap();
+            thread::sleep(operation_time);
+            drop(guard);
+
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                1,
+                "Single message should complete within timeout"
+            );
+            assert_eq!(
+                messages.lock().unwrap()[0].trim(),
+                "single",
+                "Single message content should be preserved"
+            );
+        }
+
+        // Test 4: Quick operations should allow more messages to complete
+        {
+            let operation_time = Duration::from_millis(20);
+            let timeout = Duration::from_millis(150);
+            let message_count = 5;
+
+            let (writer, counter, messages) = SlowWriter::new(operation_time);
+            let (mut non_blocking, guard) = NonBlockingBuilder::default()
+                .shutdown_timeout(timeout)
+                .finish(writer);
+
+            for i in 0..message_count {
+                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
+            }
+
+            thread::sleep(operation_time);
+            drop(guard);
+
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                message_count,
+                "Quick operations ({:?}) should allow all {} messages to complete within timeout {:?}",
+                operation_time,
+                message_count,
+                timeout
+            );
+
+            let final_messages = messages.lock().unwrap();
+            assert_eq!(
+                final_messages.len(),
+                message_count,
+                "All messages should be preserved"
+            );
+        }
     }
-
-    #[test]
-    fn shutdown_completes_before_timeout() {
-        let (mock_writer, rx) = MockWriter::new(10);
-        let short_timeout = Duration::from_millis(100);
-
-        let (mut non_blocking, guard) = NonBlockingBuilder::default()
-            .shutdown_timeout(short_timeout)
-            .finish(mock_writer);
-
-        for i in 0..3 {
-            non_blocking.write_all(format!("Message {}\n", i).as_bytes()).unwrap();
-        }
-
-        for _ in 0..3 {
-            rx.recv_timeout(Duration::from_millis(50)).unwrap();
-        }
-
-        let start = std::time::Instant::now();
-        drop(guard);
-        let elapsed = start.elapsed();
-
-        assert!(elapsed <= short_timeout);
-        assert!(elapsed < Duration::from_millis(50));
-    }
+    
 }
