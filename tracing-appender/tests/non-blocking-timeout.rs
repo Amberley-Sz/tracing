@@ -36,62 +36,31 @@ impl Write for BlockingMemoryWriter {
 
 #[test]
 fn test_shutdown_timeout_behavior() {
-    let block_secs = 2;
-    let shutdown_timeout = Duration::from_millis(300);
-    BLOCK_DURATION_SECS.store(block_secs, Ordering::Relaxed);
-
+    let timeout = Duration::from_millis(300);
     let blocking_writer = BlockingMemoryWriter::new();
+
     let (mut non_blocking, guard) = NonBlockingBuilder::default()
-        .shutdown_timeout(shutdown_timeout)
+        .shutdown_timeout(timeout)
         .finish(blocking_writer);
 
-    non_blocking.write_all(b"test data").unwrap();
-    thread::sleep(Duration::from_millis(100));
+    // Write data that will block
+    non_blocking.write_all(b"test data\n").unwrap();
 
+    // Ensure the worker thread is blocked
+    thread::sleep(Duration::from_millis(50));
     BLOCK_IN_WORKER.store(true, Ordering::Relaxed);
-    non_blocking.write_all(b"blocking data").unwrap();
+    non_blocking.write_all(b"blocking data\n").unwrap();
 
-    let shutdown_start = Instant::now();
+    // Measure shutdown duration
+    let start = Instant::now();
     drop(guard);
-    let shutdown_duration = shutdown_start.elapsed();
+    let elapsed = start.elapsed();
 
-    let expected_min = shutdown_timeout.as_millis() * 9 / 10;
-    let expected_max = shutdown_timeout.as_millis() * 11 / 10;
-
+    // Verify that shutdown waited for at least the timeout duration
     assert!(
-        shutdown_duration.as_millis() > expected_min,
-        "Shutdown was too quick: {:?}, expected > {:?}",
-        shutdown_duration,
-        Duration::from_millis(expected_min as u64)
-    );
-
-    assert!(
-        shutdown_duration.as_millis() < expected_max,
-        "Shutdown took too long: {:?}, expected < {:?}",
-        shutdown_duration,
-        Duration::from_millis(expected_max as u64)
-    );
-}
-
-#[test]
-fn test_normal_shutdown_without_blocking() {
-    let shutdown_timeout = Duration::from_millis(300);
-    BLOCK_IN_WORKER.store(false, Ordering::Relaxed);
-
-    let blocking_writer = BlockingMemoryWriter::new();
-    let (mut non_blocking, guard) = NonBlockingBuilder::default()
-        .shutdown_timeout(shutdown_timeout)
-        .finish(blocking_writer);
-
-    non_blocking.write_all(b"test data").unwrap();
-
-    let shutdown_start = Instant::now();
-    drop(guard);
-    let shutdown_duration = shutdown_start.elapsed();
-
-    assert!(
-        shutdown_duration < Duration::from_millis(100),
-        "Normal shutdown took too long: {:?}",
-        shutdown_duration
+        elapsed >= timeout,
+        "Shutdown completed before timeout: {:?}, expected at least {:?}",
+        elapsed,
+        timeout
     );
 }

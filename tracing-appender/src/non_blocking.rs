@@ -383,7 +383,7 @@ impl ErrorCounter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::sync::{mpsc, Mutex};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -530,14 +530,18 @@ mod test {
         assert_eq!(0, error_count.dropped_lines());
     }
 
-    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::{
+        io::{self, Write},
+        sync::atomic::{AtomicUsize, Ordering},
+        sync::Arc,
+    };
 
     struct ControlledWriter {
         counter: Arc<AtomicUsize>,
         ready_tx: mpsc::Sender<()>,
         proceed_rx: mpsc::Receiver<()>,
     }
-    
+
     impl ControlledWriter {
         fn new() -> (Self, mpsc::Sender<()>, mpsc::Receiver<()>) {
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -550,7 +554,7 @@ mod test {
             (writer, proceed_tx, ready_rx)
         }
     }
-    
+
     impl Write for ControlledWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.ready_tx.send(()).unwrap();
@@ -558,76 +562,104 @@ mod test {
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(buf.len())
         }
-    
+
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    
-    // Tests
+
     #[test]
-    fn test_shutdown_behavior() {
-        // Test 1: Complete processing of all messages
-        {
-            let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
-            let counter = writer.counter.clone();
-    
-            let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .finish(writer);
-    
-            // Write messages
-            for i in 0..3 {
-                non_blocking
-                    .write_all(format!("msg{}\n", i).as_bytes())
-                    .unwrap();
-            }
-    
-            // Allow all writes to complete
-            for _ in 0..3 {
-                ready_rx.recv().unwrap(); // Wait for writer to be ready
-                proceed_tx.send(()).unwrap(); // Allow writer to proceed
-            }
-    
-            drop(guard);
-    
-            assert_eq!(
-                counter.load(Ordering::SeqCst),
-                3,
-                "All messages should be processed"
-            );
+    fn test_complete_message_processing() {
+        let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
+        let counter = writer.counter.clone();
+
+        let (mut non_blocking, guard) = NonBlockingBuilder::default().finish(writer);
+
+        // Write messages
+        for i in 0..3 {
+            non_blocking
+                .write_all(format!("msg{}\n", i).as_bytes())
+                .unwrap();
         }
-    
-        // Test 2: Partial processing of messages
-        {
-            let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
-            let counter = writer.counter.clone();
-    
-            let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .finish(writer);
-    
-            // Write messages
-            for i in 0..3 {
-                non_blocking
-                    .write_all(format!("msg{}\n", i).as_bytes())
-                    .unwrap();
-            }
-    
-            // Only allow first message to complete
-            ready_rx.recv().unwrap();
-            proceed_tx.send(()).unwrap();
-    
-            drop(guard);
-    
-            let processed = counter.load(Ordering::SeqCst);
-            assert!(
-                processed >= 1,
-                "At least one message should be processed"
-            );
-            assert!(
-                processed < 3,
-                "Not all messages should be processed"
-            );
+
+        // Allow all writes to complete
+        for _ in 0..3 {
+            ready_rx.recv().unwrap(); // Wait for writer to be ready
+            proceed_tx.send(()).unwrap(); // Allow writer to proceed
         }
+
+        drop(guard);
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "All messages should be processed"
+        );
     }
-    
+
+    #[test]
+    fn test_partial_message_processing() {
+        let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
+        let counter = writer.counter.clone();
+
+        let (mut non_blocking, guard) = NonBlockingBuilder::default().finish(writer);
+
+        for i in 0..3 {
+            non_blocking
+                .write_all(format!("msg{}\n", i).as_bytes())
+                .unwrap();
+        }
+
+        ready_rx.recv().unwrap();
+        proceed_tx.send(()).unwrap();
+
+        drop(guard);
+
+        let processed = counter.load(Ordering::SeqCst);
+        assert!(processed >= 1, "At least one message should be processed");
+        assert!(processed < 3, "Not all messages should be processed");
+    }
+
+    #[test]
+    fn test_no_message_processing() {
+        let (writer, _proceed_tx, _ready_rx) = ControlledWriter::new();
+        let counter = writer.counter.clone();
+
+        let (mut non_blocking, guard) = NonBlockingBuilder::default().finish(writer);
+
+        for i in 0..3 {
+            non_blocking
+                .write_all(format!("msg{}\n", i).as_bytes())
+                .unwrap();
+        }
+
+        drop(guard);
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "No messages should be processed"
+        );
+    }
+
+    #[test]
+    fn test_single_message_processing() {
+        let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
+        let counter = writer.counter.clone();
+
+        let (mut non_blocking, guard) = NonBlockingBuilder::default().finish(writer);
+
+        non_blocking.write_all(b"single message\n").unwrap();
+
+        ready_rx.recv().unwrap();
+        proceed_tx.send(()).unwrap();
+
+        drop(guard);
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Single message should be processed"
+        );
+    }
 }
