@@ -575,17 +575,15 @@ mod test {
 
         let (mut non_blocking, guard) = NonBlockingBuilder::default().finish(writer);
 
-        // Write messages
         for i in 0..3 {
             non_blocking
                 .write_all(format!("msg{}\n", i).as_bytes())
                 .unwrap();
         }
 
-        // Allow all writes to complete
         for _ in 0..3 {
-            ready_rx.recv().unwrap(); // Wait for writer to be ready
-            proceed_tx.send(()).unwrap(); // Allow writer to proceed
+            ready_rx.recv().unwrap();
+            proceed_tx.send(()).unwrap();
         }
 
         drop(guard);

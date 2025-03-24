@@ -43,20 +43,16 @@ fn test_shutdown_timeout_behavior() {
         .shutdown_timeout(timeout)
         .finish(blocking_writer);
 
-    // Write data that will block
     non_blocking.write_all(b"test data\n").unwrap();
 
-    // Ensure the worker thread is blocked
     thread::sleep(Duration::from_millis(50));
     BLOCK_IN_WORKER.store(true, Ordering::Relaxed);
     non_blocking.write_all(b"blocking data\n").unwrap();
 
-    // Measure shutdown duration
     let start = Instant::now();
     drop(guard);
     let elapsed = start.elapsed();
 
-    // Verify that shutdown waited for at least the timeout duration
     assert!(
         elapsed >= timeout,
         "Shutdown completed before timeout: {:?}, expected at least {:?}",
