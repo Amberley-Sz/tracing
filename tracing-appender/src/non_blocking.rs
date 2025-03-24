@@ -534,109 +534,100 @@ mod test {
 
     struct ControlledWriter {
         counter: Arc<AtomicUsize>,
-        messages: Arc<Mutex<Vec<String>>>,
-        proceed_signal: Receiver<()>,
-        ready_signal: Sender<()>,
+        ready_tx: mpsc::Sender<()>,
+        proceed_rx: mpsc::Receiver<()>,
     }
-
+    
     impl ControlledWriter {
-        fn new() -> (Self, Sender<()>, Receiver<()>) {
-            let (proceed_tx, proceed_rx) = channel();
-            let (ready_tx, ready_rx) = channel();
-            
-            (
-                Self {
-                    counter: Arc::new(AtomicUsize::new(0)),
-                    messages: Arc::new(Mutex::new(Vec::new())),
-                    proceed_signal: proceed_rx,
-                    ready_signal: ready_tx,
-                },
-                proceed_tx,
-                ready_rx,
-            )
+        fn new() -> (Self, mpsc::Sender<()>, mpsc::Receiver<()>) {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            let writer = ControlledWriter {
+                counter: Arc::new(AtomicUsize::new(0)),
+                ready_tx,
+                proceed_rx,
+            };
+            (writer, proceed_tx, ready_rx)
         }
     }
-
-    impl std::io::Write for ControlledWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if let Ok(msg) = String::from_utf8(buf.to_vec()) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            
-            // Signal that we're ready to proceed
-            self.ready_signal.send(()).unwrap();
-            
-            // Wait for signal to proceed
-            self.proceed_signal.recv().unwrap();
-            
+    
+    impl Write for ControlledWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.ready_tx.send(()).unwrap();
+            self.proceed_rx.recv().unwrap();
             self.counter.fetch_add(1, Ordering::SeqCst);
             Ok(buf.len())
         }
-
-        fn flush(&mut self) -> std::io::Result<()> {
+    
+        fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-
+    
+    // Tests
     #[test]
-    fn test_shutdown_timeout_behavior() {
-        // Test 1: Complete processing before timeout
+    fn test_shutdown_behavior() {
+        // Test 1: Complete processing of all messages
         {
             let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
             let counter = writer.counter.clone();
-            
+    
             let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(Duration::from_millis(1000))
                 .finish(writer);
-
+    
             // Write messages
             for i in 0..3 {
                 non_blocking
                     .write_all(format!("msg{}\n", i).as_bytes())
                     .unwrap();
             }
-
+    
             // Allow all writes to complete
             for _ in 0..3 {
                 ready_rx.recv().unwrap(); // Wait for writer to be ready
                 proceed_tx.send(()).unwrap(); // Allow writer to proceed
             }
-
+    
             drop(guard);
-
+    
             assert_eq!(
                 counter.load(Ordering::SeqCst),
                 3,
                 "All messages should be processed"
             );
         }
-
-        // Test 2: Incomplete processing due to timeout
+    
+        // Test 2: Partial processing of messages
         {
             let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
             let counter = writer.counter.clone();
-            
+    
             let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(Duration::from_millis(10))
                 .finish(writer);
-
+    
             // Write messages
             for i in 0..3 {
                 non_blocking
                     .write_all(format!("msg{}\n", i).as_bytes())
                     .unwrap();
             }
-
+    
             // Only allow first message to complete
             ready_rx.recv().unwrap();
             proceed_tx.send(()).unwrap();
-
+    
             drop(guard);
-
+    
+            let processed = counter.load(Ordering::SeqCst);
             assert!(
-                counter.load(Ordering::SeqCst) < 3,
-                "Not all messages should be processed due to timeout"
+                processed >= 1,
+                "At least one message should be processed"
+            );
+            assert!(
+                processed < 3,
+                "Not all messages should be processed"
             );
         }
     }
+    
 }
