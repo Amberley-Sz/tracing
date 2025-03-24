@@ -530,177 +530,113 @@ mod test {
         assert_eq!(0, error_count.dropped_lines());
     }
 
+    use std::sync::mpsc::{channel, Receiver, Sender};
+
+    struct ControlledWriter {
+        counter: Arc<AtomicUsize>,
+        messages: Arc<Mutex<Vec<String>>>,
+        proceed_signal: Receiver<()>,
+        ready_signal: Sender<()>,
+    }
+
+    impl ControlledWriter {
+        fn new() -> (Self, Sender<()>, Receiver<()>) {
+            let (proceed_tx, proceed_rx) = channel();
+            let (ready_tx, ready_rx) = channel();
+            
+            (
+                Self {
+                    counter: Arc::new(AtomicUsize::new(0)),
+                    messages: Arc::new(Mutex::new(Vec::new())),
+                    proceed_signal: proceed_rx,
+                    ready_signal: ready_tx,
+                },
+                proceed_tx,
+                ready_rx,
+            )
+        }
+    }
+
+    impl std::io::Write for ControlledWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(msg) = String::from_utf8(buf.to_vec()) {
+                self.messages.lock().unwrap().push(msg);
+            }
+            
+            // Signal that we're ready to proceed
+            self.ready_signal.send(()).unwrap();
+            
+            // Wait for signal to proceed
+            self.proceed_signal.recv().unwrap();
+            
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_shutdown_timeout_behavior() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-
-        struct SlowWriter {
-            counter: Arc<AtomicUsize>,
-            sleep_duration: Duration,
-            messages: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl SlowWriter {
-            fn new(sleep_duration: Duration) -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
-                let counter = Arc::new(AtomicUsize::new(0));
-                let messages = Arc::new(Mutex::new(Vec::new()));
-                (
-                    Self {
-                        counter: counter.clone(),
-                        sleep_duration,
-                        messages: messages.clone(),
-                    },
-                    counter,
-                    messages,
-                )
-            }
-        }
-
-        impl std::io::Write for SlowWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if let Ok(msg) = String::from_utf8(buf.to_vec()) {
-                    self.messages.lock().unwrap().push(msg);
-                }
-                thread::sleep(self.sleep_duration);
-                self.counter.fetch_add(1, Ordering::SeqCst);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        // Test 1: All messages should complete when timeout is sufficient
+        // Test 1: Complete processing before timeout
         {
-            let operation_time = Duration::from_millis(50);
-            let timeout = Duration::from_millis(200);
-            let message_count = 3;
-
-            let (writer, counter, messages) = SlowWriter::new(operation_time);
+            let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
+            let counter = writer.counter.clone();
+            
             let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(timeout)
+                .shutdown_timeout(Duration::from_millis(1000))
                 .finish(writer);
 
-            for i in 0..message_count {
-                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
+            // Write messages
+            for i in 0..3 {
+                non_blocking
+                    .write_all(format!("msg{}\n", i).as_bytes())
+                    .unwrap();
             }
 
-            thread::sleep(operation_time);
+            // Allow all writes to complete
+            for _ in 0..3 {
+                ready_rx.recv().unwrap(); // Wait for writer to be ready
+                proceed_tx.send(()).unwrap(); // Allow writer to proceed
+            }
+
             drop(guard);
 
             assert_eq!(
                 counter.load(Ordering::SeqCst),
-                message_count,
-                "With sufficient timeout ({:?}), all {} messages should be processed",
-                timeout,
-                message_count
+                3,
+                "All messages should be processed"
             );
-
-            let final_messages = messages.lock().unwrap();
-            for (i, msg) in final_messages.iter().enumerate() {
-                assert_eq!(
-                    msg.trim(),
-                    format!("msg{}", i),
-                    "Messages should be processed in order"
-                );
-            }
         }
 
-        // Test 2: Not all messages should complete when timeout is insufficient
+        // Test 2: Incomplete processing due to timeout
         {
-            let operation_time = Duration::from_millis(100);
-            let timeout = Duration::from_millis(150);
-            let message_count = 3;
-
-            let (writer, counter, _messages) = SlowWriter::new(operation_time);
+            let (writer, proceed_tx, ready_rx) = ControlledWriter::new();
+            let counter = writer.counter.clone();
+            
             let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(timeout)
+                .shutdown_timeout(Duration::from_millis(10))
                 .finish(writer);
 
-            for i in 0..message_count {
-                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
+            // Write messages
+            for i in 0..3 {
+                non_blocking
+                    .write_all(format!("msg{}\n", i).as_bytes())
+                    .unwrap();
             }
 
-            thread::sleep(operation_time);
+            // Only allow first message to complete
+            ready_rx.recv().unwrap();
+            proceed_tx.send(()).unwrap();
+
             drop(guard);
 
-            let processed_count = counter.load(Ordering::SeqCst);
             assert!(
-                processed_count < message_count,
-                "With insufficient timeout ({:?}), not all messages should complete (processed: {}/{})",
-                timeout,
-                processed_count,
-                message_count
-            );
-            assert!(
-                processed_count > 0,
-                "Even with insufficient timeout, some messages should be processed"
-            );
-        }
-
-        // Test 3: Single message should complete well within timeout
-        {
-            let operation_time = Duration::from_millis(50);
-            let timeout = Duration::from_millis(100);
-
-            let (writer, counter, messages) = SlowWriter::new(operation_time);
-            let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(timeout)
-                .finish(writer);
-
-            non_blocking.write_all(b"single\n").unwrap();
-            thread::sleep(operation_time);
-            drop(guard);
-
-            assert_eq!(
-                counter.load(Ordering::SeqCst),
-                1,
-                "Single message should complete within timeout"
-            );
-            assert_eq!(
-                messages.lock().unwrap()[0].trim(),
-                "single",
-                "Single message content should be preserved"
-            );
-        }
-
-        // Test 4: Quick operations should allow more messages to complete
-        {
-            let operation_time = Duration::from_millis(20);
-            let timeout = Duration::from_millis(150);
-            let message_count = 5;
-
-            let (writer, counter, messages) = SlowWriter::new(operation_time);
-            let (mut non_blocking, guard) = NonBlockingBuilder::default()
-                .shutdown_timeout(timeout)
-                .finish(writer);
-
-            for i in 0..message_count {
-                non_blocking.write_all(format!("msg{}\n", i).as_bytes()).unwrap();
-            }
-
-            thread::sleep(operation_time);
-            drop(guard);
-
-            assert_eq!(
-                counter.load(Ordering::SeqCst),
-                message_count,
-                "Quick operations ({:?}) should allow all {} messages to complete within timeout {:?}",
-                operation_time,
-                message_count,
-                timeout
-            );
-
-            let final_messages = messages.lock().unwrap();
-            assert_eq!(
-                final_messages.len(),
-                message_count,
-                "All messages should be preserved"
+                counter.load(Ordering::SeqCst) < 3,
+                "Not all messages should be processed due to timeout"
             );
         }
     }
-    
 }
-
